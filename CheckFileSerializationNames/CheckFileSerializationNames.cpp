@@ -9,16 +9,15 @@
 #ifndef NOMINMAX
 #define NOMINMAX 1
 #endif
-// Using path::u8string() (C++20) to obtain UTF-8 bytes directly from std::filesystem::path.
-// MSVC with C++20 returns a UTF-8 encoded std::string from path::u8string().
+#include <Windows.h>
 
 namespace fs = std::filesystem;
 
 struct FileInfo
 {
-    std::u8string fileNameUtf8;   // UTF-8 に変換したファイル名（表示・ソート用）
-    std::u8string numberText;     // 正規化済み（先頭ゼロ除去）数値文字列（比較用）
-    std::size_t digitWidth;       // 元の数字列の桁数（ゼロ埋め表示用）
+    std::u8string fileNameUtf8;   // UTF-8 のファイル名
+    std::u8string numberText;     // 正規化済み（先頭ゼロ除去）数値文字列（UTF-8 bytes）
+    std::size_t digitWidth;
 };
 
 struct Range
@@ -26,11 +25,6 @@ struct Range
     std::u8string start;
     std::u8string end;
 };
-
-static std::u8string ToU8(const std::string& s)
-{
-    return std::u8string(reinterpret_cast<const char8_t*>(s.data()), reinterpret_cast<const char8_t*>(s.data()) + s.size());
-}
 
 static std::u8string ExtractFirstDigitSequenceFromUtf8(std::basic_string_view<char8_t> sv)
 {
@@ -43,41 +37,19 @@ static std::u8string ExtractFirstDigitSequenceFromUtf8(std::basic_string_view<ch
     return out;
 }
 
-// ワイド文字列から最初の連続する数字列を抽出し、ASCII の狭義文字列として返す。
-// 例: L"img_😀0123a" -> "0123"
-// kept for compatibility but not used when path::u8string() is available
-static std::string ExtractFirstDigitSequenceFromWide(const std::wstring& text)
-{
-    auto it = std::find_if(text.begin(), text.end(), [](wchar_t ch) { return std::iswdigit(ch); });
-    if (it == text.end()) return {};
-    auto it2 = std::find_if_not(it, text.end(), [](wchar_t ch) { return std::iswdigit(ch); });
-    std::string out;
-    out.reserve(static_cast<size_t>(it2 - it));
-    for (auto i = it; i != it2; ++i)
-    {
-        out.push_back(static_cast<char>(*i));
-    }
-    return out;
-}
-
 static std::basic_string_view<char8_t> TrimLeadingZeros(std::basic_string_view<char8_t> text)
 {
     const auto pos = text.find_first_not_of(static_cast<char8_t>('0'));
-    if (pos == std::basic_string_view<char8_t>::npos)
-    {
-        return text.substr(text.size() - 1);
-    }
+    if (pos == std::basic_string_view<char8_t>::npos) return text.substr(text.size() - 1);
     return text.substr(pos);
 }
 
-// 入力は数字のみの文字列を想定。比較用は正規化済み文字列（先頭ゼロ除去）を用いるのでここは軽量に。
 static int CompareNumericStringsNormalized(std::basic_string_view<char8_t> a, std::basic_string_view<char8_t> b)
 {
     a = TrimLeadingZeros(a);
     b = TrimLeadingZeros(b);
     if (a.size() != b.size()) return a.size() < b.size() ? -1 : 1;
     if (a == b) return 0;
-    // lexicographical compare on byte sequences is fine for equal-length ASCII digit sequences
     return a < b ? -1 : 1;
 }
 
@@ -105,7 +77,6 @@ static std::u8string IncrementNumericString(const std::u8string& text)
 static std::u8string DecrementNumericString(const std::u8string& text)
 {
     std::u8string result = text;
-    // if normalized zero
     if (result.size() == 1 && result[0] == static_cast<char8_t>('0')) return std::u8string(u8"0");
     int borrow = 1;
     for (auto it = result.rbegin(); it != result.rend() && borrow; ++it)
@@ -127,20 +98,61 @@ static std::u8string PadLeft(std::basic_string_view<char8_t> text, std::size_t w
     return out;
 }
 
+static std::wstring WideFromUtf8(std::u8string_view s)
+{
+    if (s.empty()) return {};
+    const char* bytes = reinterpret_cast<const char*>(s.data());
+    int len = static_cast<int>(s.size());
+    int wlen = ::MultiByteToWideChar(CP_UTF8, 0, bytes, len, nullptr, 0);
+    if (wlen == 0) return {};
+    std::wstring ws;
+    ws.resize(wlen);
+    ::MultiByteToWideChar(CP_UTF8, 0, bytes, len, &ws[0], wlen);
+    return ws;
+}
+
+static void WriteWideLine(const std::wstring& ws)
+{
+    HANDLE h = ::GetStdHandle(STD_OUTPUT_HANDLE);
+    if (h != INVALID_HANDLE_VALUE)
+    {
+        DWORD mode = 0;
+        DWORD written = 0;
+        if (::GetConsoleMode(h, &mode))
+        {
+            ::WriteConsoleW(h, ws.c_str(), static_cast<DWORD>(ws.size()), &written, nullptr);
+            ::WriteConsoleW(h, L"\n", 1, &written, nullptr);
+            return;
+        }
+    }
+    int mbsLen = ::WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), static_cast<int>(ws.size()), nullptr, 0, nullptr, nullptr);
+    if (mbsLen > 0)
+    {
+        std::string out;
+        out.resize(mbsLen);
+        ::WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), static_cast<int>(ws.size()), out.data(), mbsLen, nullptr, nullptr);
+        std::cout << out << '\n';
+    }
+}
+
+static void PrintLabelAndUtf8Value(const std::wstring& labelWide, std::u8string_view value)
+{
+    const std::wstring valWide = WideFromUtf8(value);
+    WriteWideLine(labelWide + valWide);
+}
+
 int main()
 {
     const fs::path cwd = fs::current_path();
     std::vector<FileInfo> fileInfos;
     fileInfos.reserve(256);
 
-    // 列挙はファイルシステムメタデータの読み取りのみ。ファイル内容の読み書きは行わない。
     for (const auto& entry : fs::directory_iterator(cwd))
     {
         if (!entry.is_regular_file()) continue;
         const std::u8string fname_bytes = entry.path().filename().u8string();
         const std::u8string stem_bytes = entry.path().stem().u8string();
 
-        // extract digits from UTF-8 bytes (ASCII digits)
         const std::u8string digits = ExtractFirstDigitSequenceFromUtf8(std::basic_string_view<char8_t>(stem_bytes));
         if (digits.empty()) continue;
 
@@ -152,11 +164,10 @@ int main()
 
     if (fileInfos.size() < 2)
     {
-        std::cout << "連番を判定できるファイルが2件以上見つかりませんでした。\n";
+        WriteWideLine(std::wstring(L"連番を判定できるファイルが2件以上見つかりませんでした。"));
         return 0;
     }
 
-    // 数字列は既に正規化済みなので比較は高速
     std::sort(fileInfos.begin(), fileInfos.end(), [](const FileInfo& a, const FileInfo& b) {
         const int cmp = CompareNumericStringsNormalized(std::basic_string_view<char8_t>(a.numberText), std::basic_string_view<char8_t>(b.numberText));
         if (cmp != 0) return cmp < 0;
@@ -183,25 +194,30 @@ int main()
     }
 
     const std::u8string cwdUtf8 = cwd.u8string();
-    const std::string_view cwdSv(reinterpret_cast<const char*>(cwdUtf8.data()), cwdUtf8.size());
-    std::cout << "対象フォルダ: " << cwdSv << '\n';
-    std::cout << "連番付きファイル数: " << fileInfos.size() << '\n';
+    PrintLabelAndUtf8Value(L"対象フォルダ: ", std::basic_string_view<char8_t>(cwdUtf8));
+    WriteWideLine(std::wstring(L"連番付きファイル数: ") + std::to_wstring(fileInfos.size()));
 
     if (missing.empty())
     {
-        std::cout << "番号の抜けは見つかりませんでした。\n";
+        WriteWideLine(std::wstring(L"番号の抜けは見つかりませんでした。"));
         return 0;
     }
 
-    std::cout << "抜けている番号:\n";
+    WriteWideLine(std::wstring(L"抜けている番号:"));
     for (const auto& r : missing)
     {
-        const auto s_u8 = PadLeft(std::basic_string_view<char8_t>(r.start), padWidth);
-        const auto e_u8 = PadLeft(std::basic_string_view<char8_t>(r.end), padWidth);
-        const std::string_view s_sv(reinterpret_cast<const char*>(s_u8.data()), s_u8.size());
-        const std::string_view e_sv(reinterpret_cast<const char*>(e_u8.data()), e_u8.size());
-        if (r.start == r.end) std::cout << "- " << s_sv << '\n';
-        else std::cout << "- " << s_sv << " ～ " << e_sv << '\n';
+        const std::u8string s_u8 = PadLeft(std::basic_string_view<char8_t>(r.start), padWidth);
+        const std::u8string e_u8 = PadLeft(std::basic_string_view<char8_t>(r.end), padWidth);
+        const std::wstring s_w = WideFromUtf8(std::basic_string_view<char8_t>(s_u8));
+        const std::wstring e_w = WideFromUtf8(std::basic_string_view<char8_t>(e_u8));
+        if (r.start == r.end)
+        {
+            WriteWideLine(std::wstring(L"- ") + s_w);
+        }
+        else
+        {
+            WriteWideLine(std::wstring(L"- ") + s_w + L" ～ " + e_w);
+        }
     }
 
     return 0;
